@@ -1,0 +1,19 @@
+[package]
+name = "s1eepeng-crates-oidc-replay-lab"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.85"
+description = "A small calculator for crates.io Trusted Publishing and OIDC replay experiments"
+license = "MIT"
+repository = "https://github.com/S1eepeng/crates-oidc-replay-lab"
+readme = "README.md"
+keywords = ["calculator", "oidc", "security"]
+categories = ["command-line-utilities", "development-tools::testing"]
+publish = ["crates-io"]
+
+[[bin]]
+name = "oidc-calc"
+path = "src/bin/oidc-calc.rs"
+
+[dependencies]
+
