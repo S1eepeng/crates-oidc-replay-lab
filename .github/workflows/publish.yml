@@ -3,6 +3,14 @@ name: crates.io Trusted Publishing replay lab
 on:
   workflow_dispatch:
     inputs:
+      experiment_mode:
+        description: Experiment mode
+        required: true
+        default: replay
+        type: choice
+        options:
+          - replay
+          - expiry-hold
       encryption_public_key_b64:
         description: Base64-encoded RSA public key used to encrypt secret evidence
         required: true
@@ -14,6 +22,7 @@ permissions:
 
 jobs:
   replay-experiment:
+    if: inputs.experiment_mode == 'replay'
     runs-on: ubuntu-latest
     environment: crates-io
 
@@ -248,3 +257,198 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
+  expiry-hold-experiment:
+    if: inputs.experiment_mode == 'expiry-hold'
+    runs-on: ubuntu-latest
+    environment: crates-io
+
+    steps:
+      - name: Check out the exact crate source
+        uses: actions/checkout@v6
+
+      - name: Test before requesting credentials
+        run: cargo test --locked
+
+      - name: Exchange once, publish once, and deliberately keep token active
+        shell: bash
+        env:
+          PUBLIC_KEY_B64: ${{ inputs.encryption_public_key_b64 }}
+          TOKEN_ENDPOINT: https://crates.io/api/v1/trusted_publishing/tokens
+          TEST_VERSION: 0.0.5
+        run: |
+          set -euo pipefail
+
+          secret="$RUNNER_TEMP/crates-expiry-secret"
+          artifact="$RUNNER_TEMP/crates-expiry-artifact"
+          mkdir -p "$secret" "$artifact"
+
+          cleanup() {
+            rm -rf "$secret"
+            rm -f "$RUNNER_TEMP/expiry-evidence-key" \
+              "$RUNNER_TEMP/expiry-evidence.tar.gz" \
+              "$RUNNER_TEMP/expiry-public.pem"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$PUBLIC_KEY_B64" | base64 --decode > "$RUNNER_TEMP/expiry-public.pem"
+
+          jwt="$(
+            curl --silent --show-error --fail \
+              --get \
+              --header "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              --data-urlencode 'audience=crates.io' \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r '.value'
+          )"
+          test -n "$jwt"
+          echo "::add-mask::$jwt"
+
+          exchange_at="$(date --utc --iso-8601=seconds)"
+          exchange_status="$(
+            curl --silent --show-error \
+              --output "$secret/exchange-response.json" \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header 'Content-Type: application/json' \
+              --header 'Accept: application/json' \
+              --header 'User-Agent: crates-oidc-expiry-lab/1.0' \
+              --data "$(jq -cn --arg jwt "$jwt" '{jwt: $jwt}')" \
+              "$TOKEN_ENDPOINT"
+          )"
+          echo "EXCHANGE_HTTP_STATUS=$exchange_status"
+          test "$exchange_status" = "200"
+
+          token="$(jq -r '.token' "$secret/exchange-response.json")"
+          test -n "$token"
+          echo "::add-mask::$token"
+
+          python3 - "$TEST_VERSION" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          version = sys.argv[1]
+          manifest = pathlib.Path("Cargo.toml")
+          text = manifest.read_text(encoding="utf-8")
+          text, count = re.subn(
+              r'(?m)^version = "[^"]+"$',
+              f'version = "{version}"',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("failed to update Cargo.toml version")
+          manifest.write_text(text, encoding="utf-8")
+          PY
+          cargo generate-lockfile
+
+          publish_at="$(date --utc --iso-8601=seconds)"
+          set +e
+          CARGO_REGISTRY_TOKEN="$token" \
+            cargo publish --locked --allow-dirty >"$secret/publish.log" 2>&1
+          publish_exit="$?"
+          set -e
+          echo "PUBLISH_EXIT=$publish_exit"
+
+          JWT="$jwt" TOKEN="$token" python3 - \
+            "$secret/expiry-hold.secret.json" \
+            "$exchange_at" "$publish_at" "$exchange_status" \
+            "$publish_exit" "$TEST_VERSION" \
+            "$secret/exchange-response.json" "$secret/publish.log" <<'PY'
+          import base64
+          import datetime
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import sys
+
+          def decode_part(value):
+              value += "=" * (-len(value) % 4)
+              return json.loads(base64.urlsafe_b64decode(value))
+
+          (
+              output_path,
+              exchange_at,
+              publish_at,
+              exchange_status,
+              publish_exit,
+              version,
+              exchange_response_path,
+              publish_log_path,
+          ) = sys.argv[1:]
+          jwt = os.environ["JWT"]
+          token = os.environ["TOKEN"]
+          claims = decode_part(jwt.split(".")[1])
+          issued_at = datetime.datetime.fromisoformat(exchange_at.replace("Z", "+00:00"))
+          expected_expiry = issued_at + datetime.timedelta(minutes=30)
+
+          output = {
+              "warning": "HIGHLY SENSITIVE: complete GitHub JWT and crates.io token",
+              "github_jwt": jwt,
+              "github_claims": claims,
+              "exchange": {
+                  "at": exchange_at,
+                  "request": {
+                      "method": "POST",
+                      "url": "https://crates.io/api/v1/trusted_publishing/tokens",
+                      "body": {"jwt": jwt},
+                  },
+                  "response": {
+                      "status": int(exchange_status),
+                      "body": pathlib.Path(exchange_response_path).read_text(encoding="utf-8"),
+                  },
+              },
+              "temporary_token": token,
+              "temporary_token_sha256": hashlib.sha256(token.encode()).hexdigest(),
+              "expected_server_expiry": expected_expiry.isoformat(),
+              "publish": {
+                  "at": publish_at,
+                  "version": version,
+                  "exit_code": int(publish_exit),
+                  "output": pathlib.Path(publish_log_path).read_text(encoding="utf-8"),
+              },
+              "revoked": False,
+          }
+          pathlib.Path(output_path).write_text(
+              json.dumps(output, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          token_sha256="$(printf '%s' "$token" | sha256sum | cut -d' ' -f1)"
+          expected_expiry="$(date --utc --date="$exchange_at +30 minutes" --iso-8601=seconds)"
+          jq -n \
+            --arg exchange_at "$exchange_at" \
+            --arg expected_expiry "$expected_expiry" \
+            --arg token_sha256 "$token_sha256" \
+            --arg exchange_status "$exchange_status" \
+            --arg publish_at "$publish_at" \
+            --arg publish_exit "$publish_exit" \
+            --arg version "$TEST_VERSION" \
+            '{exchange_at:$exchange_at,expected_expiry:$expected_expiry,token_sha256:$token_sha256,exchange_status:($exchange_status|tonumber),publish_at:$publish_at,publish_exit:($publish_exit|tonumber),version:$version,revoked:false}' \
+            > "$artifact/summary.json"
+
+          tar -czf "$RUNNER_TEMP/expiry-evidence.tar.gz" -C "$secret" .
+          openssl rand -hex 32 > "$RUNNER_TEMP/expiry-evidence-key"
+          openssl enc -aes-256-cbc -salt -pbkdf2 \
+            -in "$RUNNER_TEMP/expiry-evidence.tar.gz" \
+            -out "$artifact/evidence.tar.gz.enc" \
+            -pass file:"$RUNNER_TEMP/expiry-evidence-key"
+          openssl pkeyutl -encrypt -pubin \
+            -inkey "$RUNNER_TEMP/expiry-public.pem" \
+            -in "$RUNNER_TEMP/expiry-evidence-key" \
+            -out "$artifact/evidence-key.enc" \
+            -pkeyopt rsa_padding_mode:oaep \
+            -pkeyopt rsa_oaep_md:sha256
+
+          # Intentionally no DELETE request: the server-side token is left active.
+          test "$publish_exit" = "0"
+
+      - name: Upload encrypted expiry evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crates-oidc-expiry-hold-evidence
+          path: ${{ runner.temp }}/crates-expiry-artifact/
+          retention-days: 1
+          if-no-files-found: error
