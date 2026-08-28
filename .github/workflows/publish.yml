@@ -1,30 +1,250 @@
-name: crates.io Trusted Publishing lab
+name: crates.io Trusted Publishing replay lab
 
 on:
   workflow_dispatch:
+    inputs:
+      encryption_public_key_b64:
+        description: Base64-encoded RSA public key used to encrypt secret evidence
+        required: true
+        type: string
 
 permissions:
   contents: read
   id-token: write
 
 jobs:
-  publish:
+  replay-experiment:
     runs-on: ubuntu-latest
     environment: crates-io
 
     steps:
-      - name: Check out the crate source
+      - name: Check out the exact crate source
         uses: actions/checkout@v6
 
-      - name: Test the exact source to publish
+      - name: Test before requesting credentials
         run: cargo test --locked
 
-      - name: Obtain a temporary crates.io token
-        id: auth
-        uses: rust-lang/crates-io-auth-action@v1
-
-      - name: Publish the crate
-        run: cargo publish --locked
+      - name: Request JWTs, exchange tokens, publish, and test replay
+        id: experiment
+        shell: bash
         env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
+          PUBLIC_KEY_B64: ${{ inputs.encryption_public_key_b64 }}
+          TOKEN_ENDPOINT: https://crates.io/api/v1/trusted_publishing/tokens
+          CRATE_NAME: s1eepeng-crates-oidc-replay-lab
+        run: |
+          set -euo pipefail
+
+          secret="$RUNNER_TEMP/crates-oidc-secret"
+          artifact="$RUNNER_TEMP/crates-oidc-artifact"
+          mkdir -p "$secret" "$artifact"
+
+          cleanup() {
+            rm -rf "$secret"
+            rm -f "$RUNNER_TEMP/evidence-key" "$RUNNER_TEMP/evidence.tar.gz"
+          }
+          trap cleanup EXIT
+
+          printf '%s' "$PUBLIC_KEY_B64" | base64 --decode > "$RUNNER_TEMP/public.pem"
+
+          request_jwt() {
+            curl --silent --show-error --fail \
+              --get \
+              --header "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+              --data-urlencode 'audience=crates.io' \
+              "$ACTIONS_ID_TOKEN_REQUEST_URL" | jq -r '.value'
+          }
+
+          jwt1="$(request_jwt)"
+          jwt2="$(request_jwt)"
+          test -n "$jwt1"
+          test -n "$jwt2"
+          test "$jwt1" != "$jwt2"
+          echo "::add-mask::$jwt1"
+          echo "::add-mask::$jwt2"
+
+          printf '%s' "$jwt1" > "$secret/github-oidc-1.jwt"
+          printf '%s' "$jwt2" > "$secret/github-oidc-2.jwt"
+
+          JWT1="$jwt1" JWT2="$jwt2" python3 - "$secret/jwts-decoded.json" <<'PY'
+          import base64
+          import json
+          import os
+          import pathlib
+          import sys
+
+          def decode_part(value):
+              value += "=" * (-len(value) % 4)
+              return json.loads(base64.urlsafe_b64decode(value))
+
+          def decode_jwt(value):
+              header, payload, _signature = value.split(".")
+              return {"header": decode_part(header), "claims": decode_part(payload)}
+
+          output = {
+              "jwt1": decode_jwt(os.environ["JWT1"]),
+              "jwt2": decode_jwt(os.environ["JWT2"]),
+          }
+          pathlib.Path(sys.argv[1]).write_text(
+              json.dumps(output, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+          exchange() {
+            local jwt="$1"
+            local output="$2"
+            curl --silent --show-error \
+              --output "$output" \
+              --write-out '%{http_code}' \
+              --request POST \
+              --header 'Content-Type: application/json' \
+              --header 'Accept: application/json' \
+              --header 'User-Agent: crates-oidc-replay-lab/1.0' \
+              --data "$(jq -cn --arg jwt "$jwt" '{jwt: $jwt}')" \
+              "$TOKEN_ENDPOINT"
+          }
+
+          exchange1_at="$(date --utc --iso-8601=seconds)"
+          exchange1_status="$(exchange "$jwt1" "$secret/exchange-1-response.json")"
+          echo "EXCHANGE_1_HTTP_STATUS=$exchange1_status"
+          test "$exchange1_status" = "200"
+          token1="$(jq -r '.token' "$secret/exchange-1-response.json")"
+          test -n "$token1"
+          echo "::add-mask::$token1"
+
+          replay_at="$(date --utc --iso-8601=seconds)"
+          replay_status="$(exchange "$jwt1" "$secret/exchange-jwt1-replay-response.json")"
+          echo "EXACT_JWT_REPLAY_HTTP_STATUS=$replay_status"
+
+          exchange2_at="$(date --utc --iso-8601=seconds)"
+          exchange2_status="$(exchange "$jwt2" "$secret/exchange-2-response.json")"
+          echo "EXCHANGE_2_HTTP_STATUS=$exchange2_status"
+          test "$exchange2_status" = "200"
+          token2="$(jq -r '.token' "$secret/exchange-2-response.json")"
+          test -n "$token2"
+          echo "::add-mask::$token2"
+
+          set_version() {
+            python3 - "$1" <<'PY'
+          import pathlib
+          import re
+          import sys
+
+          version = sys.argv[1]
+          manifest = pathlib.Path("Cargo.toml")
+          text = manifest.read_text(encoding="utf-8")
+          text, count = re.subn(
+              r'(?m)^version = "[^"]+"$',
+              f'version = "{version}"',
+              text,
+              count=1,
+          )
+          if count != 1:
+              raise SystemExit("failed to update Cargo.toml version")
+          manifest.write_text(text, encoding="utf-8")
+          PY
+            cargo generate-lockfile
+          }
+
+          publish_with_token() {
+            local token="$1"
+            local version="$2"
+            local output="$3"
+            set_version "$version"
+            set +e
+            CARGO_REGISTRY_TOKEN="$token" \
+              cargo publish --locked --allow-dirty >"$output" 2>&1
+            local status="$?"
+            set -e
+            printf '%s' "$status"
+          }
+
+          publish1_at="$(date --utc --iso-8601=seconds)"
+          publish1_exit="$(publish_with_token "$token1" '0.0.2' "$secret/publish-token1-v0.0.2.log")"
+          echo "TOKEN1_PUBLISH_0_0_2_EXIT=$publish1_exit"
+
+          publish2_at="$(date --utc --iso-8601=seconds)"
+          publish2_exit="$(publish_with_token "$token2" '0.0.3' "$secret/publish-token2-v0.0.3.log")"
+          echo "TOKEN2_PUBLISH_0_0_3_EXIT=$publish2_exit"
+
+          publish3_at="$(date --utc --iso-8601=seconds)"
+          publish3_exit="$(publish_with_token "$token1" '0.0.4' "$secret/publish-token1-v0.0.4.log")"
+          echo "TOKEN1_REUSE_PUBLISH_0_0_4_EXIT=$publish3_exit"
+
+          revoke1_at="$(date --utc --iso-8601=seconds)"
+          revoke1_status="$(curl --silent --show-error --output "$secret/revoke-token1-response.txt" --write-out '%{http_code}' --request DELETE --header "Authorization: Bearer $token1" --header 'User-Agent: crates-oidc-replay-lab/1.0' "$TOKEN_ENDPOINT")"
+          echo "REVOKE_TOKEN1_HTTP_STATUS=$revoke1_status"
+
+          publish4_at="$(date --utc --iso-8601=seconds)"
+          publish4_exit="$(publish_with_token "$token1" '0.0.5' "$secret/publish-revoked-token1-v0.0.5.log")"
+          echo "REVOKED_TOKEN1_PUBLISH_0_0_5_EXIT=$publish4_exit"
+
+          revoke2_at="$(date --utc --iso-8601=seconds)"
+          revoke2_status="$(curl --silent --show-error --output "$secret/revoke-token2-response.txt" --write-out '%{http_code}' --request DELETE --header "Authorization: Bearer $token2" --header 'User-Agent: crates-oidc-replay-lab/1.0' "$TOKEN_ENDPOINT")"
+          echo "REVOKE_TOKEN2_HTTP_STATUS=$revoke2_status"
+
+          JWT1="$jwt1" JWT2="$jwt2" TOKEN1="$token1" TOKEN2="$token2" python3 - "$secret/http-evidence.secret.json" <<PY
+          import hashlib, json, os, pathlib, sys
+
+          def read(path):
+              return pathlib.Path(path).read_text(encoding="utf-8")
+
+          jwt1, jwt2 = os.environ["JWT1"], os.environ["JWT2"]
+          token1, token2 = os.environ["TOKEN1"], os.environ["TOKEN2"]
+          endpoint = "https://crates.io/api/v1/trusted_publishing/tokens"
+          output = {
+              "warning": "HIGHLY SENSITIVE: complete GitHub JWTs and crates.io tokens",
+              "github_jwts": {"jwt1": jwt1, "jwt2": jwt2},
+              "exchanges": [
+                  {"name": "jwt1-first-exchange", "at": "$exchange1_at", "request": {"method": "POST", "url": endpoint, "body": {"jwt": jwt1}}, "response": {"status": int("$exchange1_status"), "body": read("$secret/exchange-1-response.json")}},
+                  {"name": "exact-jwt1-replay", "at": "$replay_at", "request": {"method": "POST", "url": endpoint, "body": {"jwt": jwt1}}, "response": {"status": int("$replay_status"), "body": read("$secret/exchange-jwt1-replay-response.json")}},
+                  {"name": "jwt2-first-exchange", "at": "$exchange2_at", "request": {"method": "POST", "url": endpoint, "body": {"jwt": jwt2}}, "response": {"status": int("$exchange2_status"), "body": read("$secret/exchange-2-response.json")}},
+              ],
+              "temporary_tokens": {"token1": token1, "token2": token2},
+              "publishes": [
+                  {"token": "token1", "version": "0.0.2", "at": "$publish1_at", "exit_code": int("$publish1_exit"), "output": read("$secret/publish-token1-v0.0.2.log")},
+                  {"token": "token2", "version": "0.0.3", "at": "$publish2_at", "exit_code": int("$publish2_exit"), "output": read("$secret/publish-token2-v0.0.3.log")},
+                  {"token": "token1", "version": "0.0.4", "at": "$publish3_at", "exit_code": int("$publish3_exit"), "output": read("$secret/publish-token1-v0.0.4.log")},
+                  {"token": "token1-after-revocation", "version": "0.0.5", "at": "$publish4_at", "exit_code": int("$publish4_exit"), "output": read("$secret/publish-revoked-token1-v0.0.5.log")},
+              ],
+              "revocations": [
+                  {"token": "token1", "at": "$revoke1_at", "status": int("$revoke1_status"), "body": read("$secret/revoke-token1-response.txt")},
+                  {"token": "token2", "at": "$revoke2_at", "status": int("$revoke2_status"), "body": read("$secret/revoke-token2-response.txt")},
+              ],
+              "hashes": {
+                  "jwt1_sha256": hashlib.sha256(jwt1.encode()).hexdigest(),
+                  "jwt2_sha256": hashlib.sha256(jwt2.encode()).hexdigest(),
+                  "token1_sha256": hashlib.sha256(token1.encode()).hexdigest(),
+                  "token2_sha256": hashlib.sha256(token2.encode()).hexdigest(),
+              },
+          }
+          pathlib.Path(sys.argv[1]).write_text(json.dumps(output, indent=2) + "\n", encoding="utf-8")
+          PY
+
+          jq -n \
+            --arg jwt1_sha256 "$(printf '%s' "$jwt1" | sha256sum | cut -d' ' -f1)" \
+            --arg jwt2_sha256 "$(printf '%s' "$jwt2" | sha256sum | cut -d' ' -f1)" \
+            --arg exchange1_status "$exchange1_status" --arg replay_status "$replay_status" --arg exchange2_status "$exchange2_status" \
+            --arg publish1_exit "$publish1_exit" --arg publish2_exit "$publish2_exit" --arg publish3_exit "$publish3_exit" \
+            --arg revoke1_status "$revoke1_status" --arg publish4_exit "$publish4_exit" --arg revoke2_status "$revoke2_status" \
+            '{jwt1_sha256:$jwt1_sha256,jwt2_sha256:$jwt2_sha256,exchange1_status:($exchange1_status|tonumber),exact_jwt1_replay_status:($replay_status|tonumber),exchange2_status:($exchange2_status|tonumber),publish_token1_v0_0_2_exit:($publish1_exit|tonumber),publish_token2_v0_0_3_exit:($publish2_exit|tonumber),publish_token1_reuse_v0_0_4_exit:($publish3_exit|tonumber),revoke_token1_status:($revoke1_status|tonumber),publish_revoked_token1_v0_0_5_exit:($publish4_exit|tonumber),revoke_token2_status:($revoke2_status|tonumber)}' > "$artifact/summary.json"
+
+          tar -czf "$RUNNER_TEMP/evidence.tar.gz" -C "$secret" .
+          openssl rand -hex 32 > "$RUNNER_TEMP/evidence-key"
+          openssl enc -aes-256-cbc -salt -pbkdf2 -in "$RUNNER_TEMP/evidence.tar.gz" -out "$artifact/evidence.tar.gz.enc" -pass file:"$RUNNER_TEMP/evidence-key"
+          openssl pkeyutl -encrypt -pubin -inkey "$RUNNER_TEMP/public.pem" -in "$RUNNER_TEMP/evidence-key" -out "$artifact/evidence-key.enc" -pkeyopt rsa_padding_mode:oaep -pkeyopt rsa_oaep_md:sha256
+
+          test "$publish1_exit" = "0"
+          test "$publish2_exit" = "0"
+          test "$publish3_exit" = "0"
+          test "$publish4_exit" != "0"
+
+      - name: Upload encrypted evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crates-oidc-encrypted-evidence
+          path: ${{ runner.temp }}/crates-oidc-artifact/
+          retention-days: 1
+          if-no-files-found: error
 
